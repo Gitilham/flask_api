@@ -1,0 +1,7 @@
+venv/
+uploads/
+.env
+__pycache__/
+*.pyc
+models_backup/
+models/

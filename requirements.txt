@@ -1,0 +1,13 @@
+flask
+flask-cors
+python-dotenv
+numpy
+pandas
+opencv-python
+pillow
+werkzeug
+joblib
+ultralytics
+xgboost
+tensorflow
+scikit-learn==1.6.1
