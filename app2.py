@@ -13,12 +13,12 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 from werkzeug.utils import secure_filename
 
-# ETensorFlow dan YOLO dipakai untuk encoder frame dan deteksi wajah.
+# TensorFlow dan YOLO dipakai untuk encoder frame dan deteksi wajah.
 import tensorflow as tf
 from ultralytics import YOLO
 
 
-# ============================================================
+#w ============================================================
 # APP CONFIG
 # ============================================================
 
@@ -791,9 +791,7 @@ def extract_features_from_video(video_path: str) -> Tuple[np.ndarray, List[Dict[
     5. Gabungkan fitur sesuai kebutuhan classifier V3
     """
     seq_len = get_seq_len()
-    print('[DEBUG] STEP A - before read_video_frames', flush=True)
     frames = read_video_frames(video_path, seq_len)
-    print('[DEBUG] STEP A OK', flush=True)
 
     face_crops_bgr: List[np.ndarray] = []
     xception_inputs: List[np.ndarray] = []
@@ -803,7 +801,6 @@ def extract_features_from_video(video_path: str) -> Tuple[np.ndarray, List[Dict[
     center_crop_count = 0
 
     for frame_time, frame_bgr, repeated_frame in frames:
-        print('[DEBUG] STEP B - before crop_face_with_yolo', flush=True)
         face_crop, meta = crop_face_with_yolo(frame_bgr)
 
         if meta.get("face_detected"):
@@ -828,14 +825,10 @@ def extract_features_from_video(video_path: str) -> Tuple[np.ndarray, List[Dict[
 
     xception_batch = np.asarray(xception_inputs, dtype=np.float32)
 
-    print('[DEBUG] STEP C - before XCEPTION', flush=True)
     embeddings = XCEPTION_ENCODER.predict(xception_batch, verbose=0)
-    print('[DEBUG] STEP C OK', flush=True)
     embeddings = np.asarray(embeddings, dtype=np.float32)
 
-    print('[DEBUG] STEP D - before build_v3_feature_vector', flush=True)
     features = build_v3_feature_vector(embeddings, face_crops_bgr)
-    print('[DEBUG] STEP D OK', flush=True)
 
     feature_debug = {
         "frames_requested": seq_len,
@@ -1202,11 +1195,8 @@ def predict_video():
 
     try:
         video.save(save_path)
-        print('[DEBUG] STEP 1 - video saved', flush=True)
 
-        print('[DEBUG] STEP 2 - before extract_features_from_video', flush=True)
         features, frame_infos, feature_debug = extract_features_from_video(save_path)
-        print('[DEBUG] STEP 3 - after extract_features_from_video', flush=True)
 
         # ====================================================
         # GUARD PENTING:

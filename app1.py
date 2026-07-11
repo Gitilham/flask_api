@@ -13,7 +13,7 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 from werkzeug.utils import secure_filename
 
-# ETensorFlow dan YOLO dipakai untuk encoder frame dan deteksi wajah.
+# TensorFlow dan YOLO dipakai untuk encoder frame dan deteksi wajah.
 import tensorflow as tf
 from ultralytics import YOLO
 

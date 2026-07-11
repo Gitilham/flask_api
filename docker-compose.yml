@@ -1,0 +1,22 @@
+version: "3.9"
+
+services:
+  backend:
+    build: .
+    container_name: deepfake-backend
+
+    restart: unless-stopped
+
+    ports:
+      - "5000:5000"
+
+    volumes:
+      - ./uploads:/app/uploads
+      - ./temp:/app/temp
+      - ./models:/app/models
+
+    environment:
+      FLASK_HOST: 0.0.0.0
+      FLASK_PORT: 5000
+      FLASK_DEBUG: "False"
+
