@@ -1,22 +1,35 @@
-version: "3.9"
-
 services:
   backend:
-    build: .
+    build:
+      context: .
+    image: deepfake-backend:latest
     container_name: deepfake-backend
-
     restart: unless-stopped
-
+    env_file:
+      - .env
     ports:
       - "5000:5000"
-
     volumes:
-      - ./uploads:/app/uploads
+      - ./models:/app/models:ro
       - ./temp:/app/temp
-      - ./models:/app/models
-
+      - ./uploads:/app/uploads
     environment:
-      FLASK_HOST: 0.0.0.0
-      FLASK_PORT: 5000
-      FLASK_DEBUG: "False"
+      HOST: 0.0.0.0
+      PORT: 5000
+      INFERENCE_CONCURRENCY: 1
+      YOLO_BATCH_SIZE: 4
+      YOLO_DEVICE: cpu
+      XCEPTION_BATCH_SIZE: 8
+      DEEPFAKE_DEBUG_PIPELINE: "false"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 300s
+      retries: 3
+    networks:
+      - deepfake-net
 
+networks:
+  deepfake-net:
+    external: true

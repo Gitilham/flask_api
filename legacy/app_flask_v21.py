@@ -13,7 +13,7 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 from werkzeug.utils import secure_filename
 
-# TensorFlow dan YOLO dipakai untuk encoder frame dan deteksi wajah.
+# ETensorFlow dan YOLO dipakai untuk encoder frame dan deteksi wajah.
 import tensorflow as tf
 from ultralytics import YOLO
 
@@ -31,8 +31,8 @@ UPLOAD_FOLDER = os.getenv("UPLOAD_FOLDER", "uploads")
 TEMP_FOLDER = os.getenv("TEMP_FOLDER", "temp")
 MAX_CONTENT_LENGTH_MB = int(os.getenv("MAX_CONTENT_LENGTH_MB", "300"))
 
-CONFIG_PATH = os.getenv("CONFIG_PATH", "models/model_config_v3_fixed.json")
-MODEL_PATH = os.getenv("MODEL_PATH", "models/best_v3_artifact_xception_model.pkl")
+CONFIG_PATH = os.getenv("CONFIG_PATH", "models/config.json")
+MODEL_PATH = os.getenv("MODEL_PATH", "models/best_v21_manual_audit_local_similarity.pkl")
 SCALER_PATH = os.getenv("SCALER_PATH", "models/feature_scaler.pkl")
 YOLO_PATH = os.getenv("YOLO_PATH", "models/face_yolov8n.pt")
 XCEPTION_ENCODER_PATH = os.getenv("XCEPTION_ENCODER_PATH", "models/xception_frame_encoder_safe.keras")
@@ -54,6 +54,17 @@ XCEPTION_ENCODER = None
 
 MODEL_READY = False
 MODEL_ERROR = None
+
+# ============================================================
+# V21 LOCAL SIMILARITY CORRECTION GLOBALS
+# ============================================================
+
+MODEL_VERSION = "UNKNOWN"
+V21_BASE_USE_FLIP = False
+V21_X_REF_NORM = None
+V21_Y_REF = None
+V21_CONFIG: Dict[str, Any] = {}
+V21_SUSPICIOUS_MIN = float(os.getenv("V21_SUSPICIOUS_MIN", "0.40"))
 
 
 # ============================================================
@@ -89,7 +100,8 @@ def get_threshold() -> float:
 
 
 def get_seq_len() -> int:
-    return int(CONFIG.get("seq_len_use", 24))
+    # V3 lama memakai seq_len_use, sedangkan export Colab baru sering memakai seq_len.
+    return int(CONFIG.get("seq_len_use", CONFIG.get("seq_len", 24)))
 
 
 def get_min_face_frames() -> int:
@@ -106,7 +118,9 @@ def get_max_video_seconds() -> int:
 
 
 def get_xception_img_size() -> int:
-    return int(CONFIG.get("xception_img_size", 160))
+    # Jangan otomatis memakai img_size dari config training jika encoder backend lama inputnya 160.
+    # Set XCEPTION_IMG_SIZE di .env kalau encoder kamu memang berbeda.
+    return int(os.getenv("XCEPTION_IMG_SIZE", CONFIG.get("xception_img_size", 160)))
 
 
 def get_yolo_conf() -> float:
@@ -153,12 +167,14 @@ def load_all_models() -> None:
     """
     Load semua komponen model:
     1. Config model
-    2. Classifier sklearn ExtraTrees dari file .pkl
+    2. Classifier sklearn / payload V21 dari file .pkl
     3. Scaler fitur visual dasar
     4. YOLOv8 face detector
     5. Xception frame encoder .keras
 
-    Fungsi ini dijalankan sekali saat Flask start.
+    Catatan:
+    - Untuk V21, file .pkl berisi base_model + local similarity correction.
+    - CLASSIFIER_MODEL tetap diisi base_model agar extractor tahu jumlah fitur target.
     """
     global CONFIG
     global CLASSIFIER_PAYLOAD
@@ -168,6 +184,11 @@ def load_all_models() -> None:
     global XCEPTION_ENCODER
     global MODEL_READY
     global MODEL_ERROR
+    global MODEL_VERSION
+    global V21_BASE_USE_FLIP
+    global V21_X_REF_NORM
+    global V21_Y_REF
+    global V21_CONFIG
 
     try:
         CONFIG = load_json_config()
@@ -184,20 +205,56 @@ def load_all_models() -> None:
         if not os.path.exists(XCEPTION_ENCODER_PATH):
             raise FileNotFoundError(f"File Xception encoder tidak ditemukan: {XCEPTION_ENCODER_PATH}")
 
-        print("[INFO] Loading classifier:", MODEL_PATH)
+        print("[INFO] Loading classifier/payload:", MODEL_PATH)
         CLASSIFIER_PAYLOAD = joblib.load(MODEL_PATH)
 
+        MODEL_VERSION = "UNKNOWN"
+        V21_BASE_USE_FLIP = False
+        V21_X_REF_NORM = None
+        V21_Y_REF = None
+        V21_CONFIG = {}
+
         if isinstance(CLASSIFIER_PAYLOAD, dict):
-            # Model V3 final ada pada key best_single_model.
-            CLASSIFIER_MODEL = CLASSIFIER_PAYLOAD.get("best_single_model")
+            # ====================================================
+            # FORMAT V21:
+            # {
+            #   base_model, base_use_flip, threshold,
+            #   X_ref_norm, y_ref, correction_config, model_version
+            # }
+            # ====================================================
+            if "base_model" in CLASSIFIER_PAYLOAD and "X_ref_norm" in CLASSIFIER_PAYLOAD and "y_ref" in CLASSIFIER_PAYLOAD:
+                MODEL_VERSION = str(CLASSIFIER_PAYLOAD.get("model_version", "V21_LOCAL_SIMILARITY_CORRECTION"))
+                CLASSIFIER_MODEL = CLASSIFIER_PAYLOAD.get("base_model")
+                V21_BASE_USE_FLIP = bool(CLASSIFIER_PAYLOAD.get("base_use_flip", False))
+                V21_X_REF_NORM = np.asarray(CLASSIFIER_PAYLOAD.get("X_ref_norm"), dtype=np.float32)
+                V21_Y_REF = np.asarray(CLASSIFIER_PAYLOAD.get("y_ref"), dtype=np.int64)
+                V21_CONFIG = dict(CLASSIFIER_PAYLOAD.get("correction_config", {}))
 
-            if CLASSIFIER_MODEL is None:
-                final_model_name = CLASSIFIER_PAYLOAD.get("final_model_name")
-                trained_models = CLASSIFIER_PAYLOAD.get("trained_models", {})
+                if CLASSIFIER_MODEL is None:
+                    raise RuntimeError("base_model tidak ditemukan di payload V21.")
 
-                if final_model_name and final_model_name in trained_models:
-                    CLASSIFIER_MODEL = trained_models[final_model_name]
+                if V21_X_REF_NORM.ndim != 2 or V21_Y_REF.ndim != 1:
+                    raise RuntimeError("X_ref_norm/y_ref pada payload V21 tidak valid.")
+
+                print("[INFO] Detected V21 local similarity payload.")
+                print("[INFO] V21 correction config:", V21_CONFIG)
+                print("[INFO] V21 reference bank:", V21_X_REF_NORM.shape)
+
+            else:
+                # ====================================================
+                # FORMAT V3 LAMA
+                # ====================================================
+                MODEL_VERSION = "V3_ARTIFACT_XCEPTION"
+                CLASSIFIER_MODEL = CLASSIFIER_PAYLOAD.get("best_single_model")
+
+                if CLASSIFIER_MODEL is None:
+                    final_model_name = CLASSIFIER_PAYLOAD.get("final_model_name")
+                    trained_models = CLASSIFIER_PAYLOAD.get("trained_models", {})
+
+                    if final_model_name and final_model_name in trained_models:
+                        CLASSIFIER_MODEL = trained_models[final_model_name]
         else:
+            MODEL_VERSION = "SKLEARN_DIRECT"
             CLASSIFIER_MODEL = CLASSIFIER_PAYLOAD
 
         if CLASSIFIER_MODEL is None:
@@ -216,6 +273,7 @@ def load_all_models() -> None:
         MODEL_ERROR = None
 
         print("[INFO] Semua model berhasil dimuat.")
+        print("[INFO] Model version:", MODEL_VERSION)
         print("[INFO] Classifier:", type(CLASSIFIER_MODEL))
         print("[INFO] Expected classifier features:", getattr(CLASSIFIER_MODEL, "n_features_in_", "unknown"))
         print("[INFO] Classifier classes:", getattr(CLASSIFIER_MODEL, "classes_", "unknown"))
@@ -229,7 +287,6 @@ def load_all_models() -> None:
         MODEL_ERROR = str(error)
         print("[ERROR] Gagal load model:")
         traceback.print_exc()
-
 
 # ============================================================
 # VIDEO READ + FACE DETECTION
@@ -734,7 +791,9 @@ def extract_features_from_video(video_path: str) -> Tuple[np.ndarray, List[Dict[
     5. Gabungkan fitur sesuai kebutuhan classifier V3
     """
     seq_len = get_seq_len()
+    print('[DEBUG] STEP A - before read_video_frames', flush=True)
     frames = read_video_frames(video_path, seq_len)
+    print('[DEBUG] STEP A OK', flush=True)
 
     face_crops_bgr: List[np.ndarray] = []
     xception_inputs: List[np.ndarray] = []
@@ -744,6 +803,7 @@ def extract_features_from_video(video_path: str) -> Tuple[np.ndarray, List[Dict[
     center_crop_count = 0
 
     for frame_time, frame_bgr, repeated_frame in frames:
+        print('[DEBUG] STEP B - before crop_face_with_yolo', flush=True)
         face_crop, meta = crop_face_with_yolo(frame_bgr)
 
         if meta.get("face_detected"):
@@ -768,10 +828,14 @@ def extract_features_from_video(video_path: str) -> Tuple[np.ndarray, List[Dict[
 
     xception_batch = np.asarray(xception_inputs, dtype=np.float32)
 
+    print('[DEBUG] STEP C - before XCEPTION', flush=True)
     embeddings = XCEPTION_ENCODER.predict(xception_batch, verbose=0)
+    print('[DEBUG] STEP C OK', flush=True)
     embeddings = np.asarray(embeddings, dtype=np.float32)
 
+    print('[DEBUG] STEP D - before build_v3_feature_vector', flush=True)
     features = build_v3_feature_vector(embeddings, face_crops_bgr)
+    print('[DEBUG] STEP D OK', flush=True)
 
     feature_debug = {
         "frames_requested": seq_len,
@@ -791,16 +855,189 @@ def extract_features_from_video(video_path: str) -> Tuple[np.ndarray, List[Dict[
 # PREDICTION
 # ============================================================
 
+def is_v21_payload() -> bool:
+    return (
+        isinstance(CLASSIFIER_PAYLOAD, dict)
+        and "base_model" in CLASSIFIER_PAYLOAD
+        and V21_X_REF_NORM is not None
+        and V21_Y_REF is not None
+        and isinstance(V21_CONFIG, dict)
+        and len(V21_CONFIG) > 0
+    )
+
+
+def l2_normalize(X: np.ndarray) -> np.ndarray:
+    X = np.asarray(X, dtype=np.float32)
+
+    if X.ndim == 1:
+        X = X.reshape(1, -1)
+
+    norm = np.linalg.norm(X, axis=1, keepdims=True)
+    return X / (norm + 1e-8)
+
+
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def logit(p):
+    p = np.clip(p, 1e-6, 1 - 1e-6)
+    return np.log(p / (1 - p))
+
+
+def get_model_fake_score(model, features: np.ndarray) -> float:
+    """Ambil probabilitas class 1/FAKE dari model sklearn."""
+    features = np.asarray(features, dtype=np.float32)
+
+    if hasattr(model, "predict_proba"):
+        proba = model.predict_proba(features)[0]
+        classes = list(model.classes_)
+
+        if 1 in classes:
+            return float(proba[classes.index(1)])
+
+        return float(proba[-1])
+
+    pred = int(model.predict(features)[0])
+    return 1.0 if pred == 1 else 0.0
+
+
+def apply_flip_score(score_fake: float, use_flip: bool) -> float:
+    return float(1.0 - score_fake) if use_flip else float(score_fake)
+
+
+def knn_prob_fake_single(features: np.ndarray, k: int = 15, temp: float = 0.05, power: float = 1.0) -> float:
+    """Local similarity correction milik V21."""
+    if V21_X_REF_NORM is None or V21_Y_REF is None:
+        return 0.5
+
+    x_norm = l2_normalize(features)
+    sims = x_norm @ V21_X_REF_NORM.T
+
+    k = int(min(max(1, k), V21_X_REF_NORM.shape[0]))
+    idx = np.argpartition(-sims, kth=k - 1, axis=1)[:, :k]
+
+    row_ids = np.arange(sims.shape[0])[:, None]
+    top_sims = sims[row_ids, idx]
+    top_labels = V21_Y_REF[idx]
+
+    z = (top_sims - top_sims.max(axis=1, keepdims=True)) / float(temp)
+    weights = np.exp(z)
+
+    if float(power) != 1.0:
+        weights = weights ** float(power)
+
+    prob = (weights * top_labels).sum(axis=1) / (weights.sum(axis=1) + 1e-8)
+    return float(prob[0])
+
+
+def blend_prob(base_prob: float, local_prob: float, alpha: float = 0.75, mode: str = "linear") -> float:
+    base_prob = float(base_prob)
+    local_prob = float(local_prob)
+    alpha = float(alpha)
+
+    if mode == "linear":
+        return float((alpha * base_prob) + ((1.0 - alpha) * local_prob))
+
+    if mode == "logit":
+        return float(sigmoid((alpha * logit(base_prob)) + ((1.0 - alpha) * logit(local_prob))))
+
+    if mode == "borderline":
+        center = 0.49
+        dist = abs(base_prob - center)
+        gate = np.clip(1.0 - (dist / 0.12), 0.0, 1.0)
+        mixed = (alpha * base_prob) + ((1.0 - alpha) * local_prob)
+        return float(((1.0 - gate) * base_prob) + (gate * mixed))
+
+    return float((alpha * base_prob) + ((1.0 - alpha) * local_prob))
+
+
+def predict_with_v21(features: np.ndarray) -> Dict[str, Any]:
+    """Prediksi memakai V21 = base model + local similarity correction."""
+    threshold = get_threshold()
+    features = np.asarray(features, dtype=np.float32).reshape(1, -1)
+
+    expected_features = int(getattr(CLASSIFIER_MODEL, "n_features_in_", features.shape[1]))
+    if features.shape[1] != expected_features:
+        features = pad_or_truncate(features.ravel(), expected_features).reshape(1, -1)
+
+    raw_fake = get_model_fake_score(CLASSIFIER_MODEL, features)
+    base_score_fake = apply_flip_score(raw_fake, V21_BASE_USE_FLIP)
+
+    local_score_fake = knn_prob_fake_single(
+        features,
+        k=int(V21_CONFIG.get("k", 15)),
+        temp=float(V21_CONFIG.get("temp", 0.05)),
+        power=float(V21_CONFIG.get("power", 1.0))
+    )
+
+    fake_score = blend_prob(
+        base_score_fake,
+        local_score_fake,
+        alpha=float(V21_CONFIG.get("alpha", 0.75)),
+        mode=str(V21_CONFIG.get("mode", "linear"))
+    )
+
+    real_score = float(1.0 - fake_score)
+
+    if fake_score >= threshold:
+        prediction = "DEEPFAKE"
+        label = "DEEPFAKE"
+        confidence = fake_score
+    else:
+        prediction = "REAL"
+        confidence = real_score
+        # Supaya fake realistis yang dekat batas tidak langsung dianggap aman.
+        if fake_score >= V21_SUSPICIOUS_MIN:
+            label = "MENCURIGAKAN"
+        else:
+            label = "REAL"
+
+    margin = abs(fake_score - threshold)
+
+    if label == "MENCURIGAKAN":
+        confidence_note = "Mencurigakan / perlu review manual"
+        decision_explanation = (
+            "fake_score belum melewati threshold DEEPFAKE, tetapi berada di area mencurigakan. "
+            "Sistem menyarankan review manual."
+        )
+    elif margin < 0.05:
+        confidence_note = "Kurang yakin / dekat threshold"
+        decision_explanation = "Keputusan dekat dengan threshold model."
+    elif margin < 0.12:
+        confidence_note = "Cukup yakin"
+        decision_explanation = "Keputusan cukup jauh dari threshold model."
+    else:
+        confidence_note = "Yakin"
+        decision_explanation = "Keputusan jauh dari threshold model."
+
+    return {
+        "prediction": prediction,
+        "label": label,
+        "status": label,
+        "confidence": round(float(confidence), 6),
+        "real_score": round(float(real_score), 6),
+        "fake_score": round(float(fake_score), 6),
+        "base_score_fake": round(float(base_score_fake), 6),
+        "local_score_fake": round(float(local_score_fake), 6),
+        "threshold": round(float(threshold), 6),
+        "margin": round(float(margin), 6),
+        "confidence_note": confidence_note,
+        "decision_rule": "DEEPFAKE jika fake_score >= threshold; MENCURIGAKAN jika 0.40 <= fake_score < threshold; REAL jika fake_score < 0.40",
+        "decision_explanation": decision_explanation,
+        "model_version": MODEL_VERSION,
+    }
+
+
 def predict_with_classifier(features: np.ndarray) -> Dict[str, Any]:
     """
-    Prediksi REAL/DEEPFAKE menggunakan classifier sklearn.
-
-    Catatan penting:
-    - Model V3 final kamu adalah FIXED_NO_FLIP.
-    - Jangan membalik score.
-    - Class 0 = REAL
-    - Class 1 = FAKE/DEEPFAKE
+    Prediksi REAL/DEEPFAKE.
+    Otomatis memakai alur V21 jika payload model adalah V21.
+    Kalau bukan V21, fallback ke alur V3 lama.
     """
+    if is_v21_payload():
+        return predict_with_v21(features)
+
     threshold = get_threshold()
 
     if hasattr(CLASSIFIER_MODEL, "predict_proba"):
@@ -829,9 +1066,11 @@ def predict_with_classifier(features: np.ndarray) -> Dict[str, Any]:
 
     if fake_score >= threshold:
         prediction = "DEEPFAKE"
+        label = "DEEPFAKE"
         confidence = fake_score
     else:
         prediction = "REAL"
+        label = "REAL"
         confidence = real_score
 
     margin = abs(fake_score - threshold)
@@ -843,7 +1082,6 @@ def predict_with_classifier(features: np.ndarray) -> Dict[str, Any]:
     else:
         confidence_note = "Yakin"
 
-    # Keterangan tambahan agar website tidak membingungkan pengguna.
     if prediction == "DEEPFAKE" and real_score > fake_score:
         decision_explanation = (
             "Label DEEPFAKE karena fake_score melewati threshold, "
@@ -856,6 +1094,8 @@ def predict_with_classifier(features: np.ndarray) -> Dict[str, Any]:
 
     return {
         "prediction": prediction,
+        "label": label,
+        "status": label,
         "confidence": round(float(confidence), 6),
         "real_score": round(float(real_score), 6),
         "fake_score": round(float(fake_score), 6),
@@ -864,8 +1104,8 @@ def predict_with_classifier(features: np.ndarray) -> Dict[str, Any]:
         "confidence_note": confidence_note,
         "decision_rule": "DEEPFAKE jika fake_score >= threshold, REAL jika fake_score < threshold",
         "decision_explanation": decision_explanation,
+        "model_version": MODEL_VERSION,
     }
-
 
 # ============================================================
 # ROUTES
@@ -901,6 +1141,9 @@ def model_info():
         "model_error": MODEL_ERROR,
         "config": CONFIG,
         "threshold": get_threshold() if MODEL_READY else None,
+        "model_version": MODEL_VERSION,
+        "v21_correction_config": V21_CONFIG if is_v21_payload() else None,
+        "v21_reference_shape": list(V21_X_REF_NORM.shape) if V21_X_REF_NORM is not None else None,
         "paths": {
             "config_path": CONFIG_PATH,
             "model_path": MODEL_PATH,
@@ -959,8 +1202,11 @@ def predict_video():
 
     try:
         video.save(save_path)
+        print('[DEBUG] STEP 1 - video saved', flush=True)
 
+        print('[DEBUG] STEP 2 - before extract_features_from_video', flush=True)
         features, frame_infos, feature_debug = extract_features_from_video(save_path)
+        print('[DEBUG] STEP 3 - after extract_features_from_video', flush=True)
 
         # ====================================================
         # GUARD PENTING:
@@ -1034,14 +1280,19 @@ def predict_video():
         return jsonify({
             "success": True,
             "prediction": result["prediction"],
+            "label": result.get("label", result["prediction"]),
+            "status": result.get("status", result.get("label", result["prediction"])),
             "confidence": result["confidence"],
             "real_score": result["real_score"],
             "fake_score": result["fake_score"],
+            "base_score_fake": result.get("base_score_fake"),
+            "local_score_fake": result.get("local_score_fake"),
             "threshold": result["threshold"],
             "margin": result["margin"],
             "confidence_note": result["confidence_note"],
             "decision_rule": result["decision_rule"],
             "decision_explanation": result["decision_explanation"],
+            "model_version": result.get("model_version", MODEL_VERSION),
             "duration_seconds": duration_seconds,
             "message": "Prediksi berhasil",
             "frames_used": len(frame_infos),
@@ -1068,3 +1319,5 @@ if __name__ == "__main__":
     debug = os.getenv("FLASK_DEBUG", "True").lower() == "true"
 
     app.run(host=host, port=port, debug=debug)
+
+

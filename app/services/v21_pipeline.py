@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import time
 import uuid
 import traceback
@@ -8,13 +9,11 @@ from typing import List, Tuple, Dict, Any, Optional
 import cv2
 import joblib
 import numpy as np
-from flask import Flask, request, jsonify
-from flask_cors import CORS
 from dotenv import load_dotenv
-from werkzeug.utils import secure_filename
 
-# TensorFlow dan YOLO dipakai untuk encoder frame dan deteksi wajah.
+# ETensorFlow dan YOLO dipakai untuk encoder frame dan deteksi wajah.
 import tensorflow as tf
+import torch
 from ultralytics import YOLO
 
 
@@ -23,9 +22,6 @@ from ultralytics import YOLO
 # ============================================================
 
 load_dotenv()
-
-app = Flask(__name__)
-CORS(app)
 
 UPLOAD_FOLDER = os.getenv("UPLOAD_FOLDER", "uploads")
 TEMP_FOLDER = os.getenv("TEMP_FOLDER", "temp")
@@ -37,13 +33,7 @@ SCALER_PATH = os.getenv("SCALER_PATH", "models/feature_scaler.pkl")
 YOLO_PATH = os.getenv("YOLO_PATH", "models/face_yolov8n.pt")
 XCEPTION_ENCODER_PATH = os.getenv("XCEPTION_ENCODER_PATH", "models/xception_frame_encoder_safe.keras")
 
-app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
-app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH_MB * 1024 * 1024
-
 ALLOWED_EXTENSIONS = {"mp4", "avi", "mov", "mkv"}
-
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(TEMP_FOLDER, exist_ok=True)
 
 CONFIG: Dict[str, Any] = {}
 CLASSIFIER_PAYLOAD = None
@@ -64,7 +54,30 @@ V21_BASE_USE_FLIP = False
 V21_X_REF_NORM = None
 V21_Y_REF = None
 V21_CONFIG: Dict[str, Any] = {}
-V21_SUSPICIOUS_MIN = float(os.getenv("V21_SUSPICIOUS_MIN", "0.40"))
+def determine_final_decision(fake_score: float, threshold: float = 0.5) -> str:
+    """Classify the full-precision final fake probability."""
+    score = float(fake_score)
+    limit = float(threshold)
+    if not math.isfinite(score):
+        raise ValueError("fake_score harus berupa angka finite")
+    score = max(0.0, min(1.0, score))
+    if math.isclose(score, limit, rel_tol=0.0, abs_tol=1e-9):
+        return "MENCURIGAKAN"
+    return "DEEPFAKE" if score > limit else "REAL"
+
+
+def configure_paths(settings) -> None:
+    """Inject runtime paths before the one-time lifespan model load."""
+    global UPLOAD_FOLDER, TEMP_FOLDER, MAX_CONTENT_LENGTH_MB
+    global CONFIG_PATH, MODEL_PATH, SCALER_PATH, YOLO_PATH, XCEPTION_ENCODER_PATH
+    UPLOAD_FOLDER = str(settings.upload_folder)
+    TEMP_FOLDER = str(settings.temp_folder)
+    MAX_CONTENT_LENGTH_MB = int(settings.max_content_length_mb)
+    CONFIG_PATH = str(settings.config_path)
+    MODEL_PATH = str(settings.model_path)
+    SCALER_PATH = str(settings.scaler_path)
+    YOLO_PATH = str(settings.yolo_path)
+    XCEPTION_ENCODER_PATH = str(settings.xception_encoder_path)
 
 
 # ============================================================
@@ -265,6 +278,8 @@ def load_all_models() -> None:
 
         print("[INFO] Loading YOLO:", YOLO_PATH)
         YOLO_MODEL = YOLO(YOLO_PATH)
+        if getattr(YOLO_MODEL, "model", None) is not None:
+            YOLO_MODEL.model.eval()
 
         print("[INFO] Loading Xception encoder:", XCEPTION_ENCODER_PATH)
         XCEPTION_ENCODER = tf.keras.models.load_model(XCEPTION_ENCODER_PATH, compile=False)
@@ -372,11 +387,12 @@ def crop_face_with_yolo(frame_bgr: np.ndarray) -> Tuple[np.ndarray, Dict[str, An
     }
 
     try:
-        results = YOLO_MODEL.predict(
-            source=frame_bgr,
-            conf=get_yolo_conf(),
-            verbose=False
-        )
+        with torch.inference_mode():
+            results = YOLO_MODEL.predict(
+                source=frame_bgr,
+                conf=get_yolo_conf(),
+                verbose=False
+            )
 
         best_box = None
         best_conf = 0.0
@@ -791,9 +807,10 @@ def extract_features_from_video(video_path: str) -> Tuple[np.ndarray, List[Dict[
     5. Gabungkan fitur sesuai kebutuhan classifier V3
     """
     seq_len = get_seq_len()
-    print('[DEBUG] STEP A - before read_video_frames', flush=True)
+    pipeline_started = time.perf_counter()
+    stage_started = time.perf_counter()
     frames = read_video_frames(video_path, seq_len)
-    print('[DEBUG] STEP A OK', flush=True)
+    frame_extraction_seconds = time.perf_counter() - stage_started
 
     face_crops_bgr: List[np.ndarray] = []
     xception_inputs: List[np.ndarray] = []
@@ -802,8 +819,8 @@ def extract_features_from_video(video_path: str) -> Tuple[np.ndarray, List[Dict[
     face_detected_count = 0
     center_crop_count = 0
 
+    stage_started = time.perf_counter()
     for frame_time, frame_bgr, repeated_frame in frames:
-        print('[DEBUG] STEP B - before crop_face_with_yolo', flush=True)
         face_crop, meta = crop_face_with_yolo(frame_bgr)
 
         if meta.get("face_detected"):
@@ -826,16 +843,21 @@ def extract_features_from_video(video_path: str) -> Tuple[np.ndarray, List[Dict[
             "crop_method": meta.get("crop_method"),
         })
 
+    face_detection_crop_seconds = time.perf_counter() - stage_started
     xception_batch = np.asarray(xception_inputs, dtype=np.float32)
 
-    print('[DEBUG] STEP C - before XCEPTION', flush=True)
-    embeddings = XCEPTION_ENCODER.predict(xception_batch, verbose=0)
-    print('[DEBUG] STEP C OK', flush=True)
+    stage_started = time.perf_counter()
+    embeddings = XCEPTION_ENCODER.predict(
+        xception_batch,
+        batch_size=max(1, int(os.getenv("XCEPTION_BATCH_SIZE", "8"))),
+        verbose=0,
+    )
+    xception_seconds = time.perf_counter() - stage_started
     embeddings = np.asarray(embeddings, dtype=np.float32)
 
-    print('[DEBUG] STEP D - before build_v3_feature_vector', flush=True)
+    stage_started = time.perf_counter()
     features = build_v3_feature_vector(embeddings, face_crops_bgr)
-    print('[DEBUG] STEP D OK', flush=True)
+    feature_vector_seconds = time.perf_counter() - stage_started
 
     feature_debug = {
         "frames_requested": seq_len,
@@ -846,6 +868,13 @@ def extract_features_from_video(video_path: str) -> Tuple[np.ndarray, List[Dict[
         "feature_vector_shape": list(features.shape),
         "classifier_expected_features": int(getattr(CLASSIFIER_MODEL, "n_features_in_", 0)),
         "scaler_features": int(getattr(SCALER, "n_features_in_", 0)),
+        "timings": {
+            "frame_extraction_seconds": round(frame_extraction_seconds, 6),
+            "face_detection_crop_seconds": round(face_detection_crop_seconds, 6),
+            "xception_seconds": round(xception_seconds, 6),
+            "feature_vector_seconds": round(feature_vector_seconds, 6),
+            "feature_pipeline_seconds": round(time.perf_counter() - pipeline_started, 6),
+        },
     }
 
     return features, frame_infos, feature_debug
@@ -980,27 +1009,26 @@ def predict_with_v21(features: np.ndarray) -> Dict[str, Any]:
 
     real_score = float(1.0 - fake_score)
 
-    if fake_score >= threshold:
+    decision = determine_final_decision(fake_score, threshold)
+
+    if decision == "DEEPFAKE":
         prediction = "DEEPFAKE"
         label = "DEEPFAKE"
         confidence = fake_score
-    else:
+    elif decision == "REAL":
         prediction = "REAL"
+        label = "REAL"
         confidence = real_score
-        # Supaya fake realistis yang dekat batas tidak langsung dianggap aman.
-        if fake_score >= V21_SUSPICIOUS_MIN:
-            label = "MENCURIGAKAN"
-        else:
-            label = "REAL"
+    else:
+        prediction = "MENCURIGAKAN"
+        label = "MENCURIGAKAN"
+        confidence = 0.5
 
     margin = abs(fake_score - threshold)
 
     if label == "MENCURIGAKAN":
-        confidence_note = "Mencurigakan / perlu review manual"
-        decision_explanation = (
-            "fake_score belum melewati threshold DEEPFAKE, tetapi berada di area mencurigakan. "
-            "Sistem menyarankan review manual."
-        )
+        confidence_note = "Tepat di batas 50% / perlu review manual"
+        decision_explanation = "fake_score tepat sama dengan threshold 50%, sehingga hasil dinyatakan MENCURIGAKAN."
     elif margin < 0.05:
         confidence_note = "Kurang yakin / dekat threshold"
         decision_explanation = "Keputusan dekat dengan threshold model."
@@ -1023,7 +1051,7 @@ def predict_with_v21(features: np.ndarray) -> Dict[str, Any]:
         "threshold": round(float(threshold), 6),
         "margin": round(float(margin), 6),
         "confidence_note": confidence_note,
-        "decision_rule": "DEEPFAKE jika fake_score >= threshold; MENCURIGAKAN jika 0.40 <= fake_score < threshold; REAL jika fake_score < 0.40",
+        "decision_rule": "DEEPFAKE jika fake_score > 50%; MENCURIGAKAN jika fake_score = 50%; REAL jika fake_score < 50%",
         "decision_explanation": decision_explanation,
         "model_version": MODEL_VERSION,
     }
@@ -1064,14 +1092,20 @@ def predict_with_classifier(features: np.ndarray) -> Dict[str, Any]:
             real_score = 1.0
             fake_score = 0.0
 
-    if fake_score >= threshold:
+    decision = determine_final_decision(fake_score, threshold)
+
+    if decision == "DEEPFAKE":
         prediction = "DEEPFAKE"
         label = "DEEPFAKE"
         confidence = fake_score
-    else:
+    elif decision == "REAL":
         prediction = "REAL"
         label = "REAL"
         confidence = real_score
+    else:
+        prediction = "MENCURIGAKAN"
+        label = "MENCURIGAKAN"
+        confidence = 0.5
 
     margin = abs(fake_score - threshold)
 
@@ -1082,13 +1116,16 @@ def predict_with_classifier(features: np.ndarray) -> Dict[str, Any]:
     else:
         confidence_note = "Yakin"
 
-    if prediction == "DEEPFAKE" and real_score > fake_score:
+    if prediction == "MENCURIGAKAN":
+        confidence_note = "Tepat di batas 50% / perlu review manual"
+        decision_explanation = "fake_score tepat sama dengan threshold 50%, sehingga hasil dinyatakan MENCURIGAKAN."
+    elif prediction == "DEEPFAKE" and real_score > fake_score:
         decision_explanation = (
             "Label DEEPFAKE karena fake_score melewati threshold, "
             "meskipun real_score lebih besar dari fake_score."
         )
     elif prediction == "DEEPFAKE":
-        decision_explanation = "Label DEEPFAKE karena fake_score >= threshold."
+        decision_explanation = "Label DEEPFAKE karena fake_score > threshold."
     else:
         decision_explanation = "Label REAL karena fake_score < threshold."
 
@@ -1102,220 +1139,7 @@ def predict_with_classifier(features: np.ndarray) -> Dict[str, Any]:
         "threshold": round(float(threshold), 6),
         "margin": round(float(margin), 6),
         "confidence_note": confidence_note,
-        "decision_rule": "DEEPFAKE jika fake_score >= threshold, REAL jika fake_score < threshold",
+        "decision_rule": "DEEPFAKE jika fake_score > 50%; MENCURIGAKAN jika fake_score = 50%; REAL jika fake_score < 50%",
         "decision_explanation": decision_explanation,
         "model_version": MODEL_VERSION,
     }
-
-# ============================================================
-# ROUTES
-# ============================================================
-
-@app.route("/", methods=["GET"])
-def index():
-    return jsonify({
-        "success": True,
-        "message": "Flask API Deepfake Detection aktif",
-        "endpoint": "/predict-video",
-        "model_ready": MODEL_READY,
-        "model_error": MODEL_ERROR,
-        "model_name": CONFIG.get("model_name") if CONFIG else None
-    })
-
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({
-        "success": MODEL_READY,
-        "status": "healthy" if MODEL_READY else "model_error",
-        "message": "API berjalan normal" if MODEL_READY else "API aktif tetapi model gagal dimuat",
-        "model_error": MODEL_ERROR
-    })
-
-
-@app.route("/model-info", methods=["GET"])
-def model_info():
-    info = {
-        "success": MODEL_READY,
-        "model_ready": MODEL_READY,
-        "model_error": MODEL_ERROR,
-        "config": CONFIG,
-        "threshold": get_threshold() if MODEL_READY else None,
-        "model_version": MODEL_VERSION,
-        "v21_correction_config": V21_CONFIG if is_v21_payload() else None,
-        "v21_reference_shape": list(V21_X_REF_NORM.shape) if V21_X_REF_NORM is not None else None,
-        "paths": {
-            "config_path": CONFIG_PATH,
-            "model_path": MODEL_PATH,
-            "scaler_path": SCALER_PATH,
-            "yolo_path": YOLO_PATH,
-            "xception_encoder_path": XCEPTION_ENCODER_PATH
-        }
-    }
-
-    if CLASSIFIER_MODEL is not None:
-        info["classifier_type"] = str(type(CLASSIFIER_MODEL))
-        info["classifier_features"] = int(getattr(CLASSIFIER_MODEL, "n_features_in_", 0))
-        info["classifier_classes"] = [int(x) for x in getattr(CLASSIFIER_MODEL, "classes_", [])]
-
-    if SCALER is not None:
-        info["scaler_features"] = int(getattr(SCALER, "n_features_in_", 0))
-
-    return jsonify(info)
-
-
-@app.route("/predict-video", methods=["POST"])
-def predict_video():
-    start_time = time.time()
-
-    if not MODEL_READY:
-        return jsonify({
-            "success": False,
-            "message": "Model belum siap atau gagal dimuat.",
-            "model_error": MODEL_ERROR
-        }), 500
-
-    if "video" not in request.files:
-        return jsonify({
-            "success": False,
-            "message": "File video tidak ditemukan. Gunakan field bernama video."
-        }), 400
-
-    video = request.files["video"]
-
-    if video.filename == "":
-        return jsonify({
-            "success": False,
-            "message": "Nama file video kosong."
-        }), 400
-
-    if not allowed_file(video.filename):
-        return jsonify({
-            "success": False,
-            "message": "Format video tidak didukung. Gunakan mp4, avi, mov, atau mkv."
-        }), 400
-
-    original_filename = secure_filename(video.filename)
-    ext = original_filename.rsplit(".", 1)[1].lower()
-    unique_filename = f"{uuid.uuid4().hex}.{ext}"
-    save_path = os.path.join(app.config["UPLOAD_FOLDER"], unique_filename)
-
-    try:
-        video.save(save_path)
-        print('[DEBUG] STEP 1 - video saved', flush=True)
-
-        print('[DEBUG] STEP 2 - before extract_features_from_video', flush=True)
-        features, frame_infos, feature_debug = extract_features_from_video(save_path)
-        print('[DEBUG] STEP 3 - after extract_features_from_video', flush=True)
-
-        # ====================================================
-        # GUARD PENTING:
-        # Model V3 dilatih untuk video yang memiliki wajah.
-        # Jika YOLO tidak menemukan wajah atau wajah terlalu sedikit,
-        # jangan paksa klasifikasi sebagai REAL/DEEPFAKE.
-        # ====================================================
-        min_face_frames = get_min_face_frames()
-        face_detected_count = int(feature_debug.get("face_detected_count", 0))
-
-        if face_detected_count < min_face_frames:
-            duration_seconds = round(time.time() - start_time, 2)
-
-            frames_response = []
-            for frame in frame_infos:
-                frames_response.append({
-                    "frame_time": frame["frame_time"],
-                    "status": "wajah tidak terdeteksi" if not frame["face_detected"] else "wajah terdeteksi",
-                    "face_detected": frame["face_detected"],
-                    "face_confidence": frame["face_confidence"],
-                    "crop_method": frame["crop_method"],
-                    "repeated_frame": frame["repeated_frame"],
-                    "bbox": frame["bbox"],
-                    "note": "Video tidak diklasifikasikan karena jumlah frame wajah tidak mencukupi."
-                })
-
-            return jsonify({
-                "success": True,
-                "prediction": "NO_FACE",
-                "label": "NO_FACE",
-                "confidence": 0.0,
-                "real_score": None,
-                "fake_score": None,
-                "threshold": get_threshold(),
-                "margin": None,
-                "confidence_note": "Wajah tidak terdeteksi / frame wajah tidak mencukupi",
-                "decision_rule": "Klasifikasi hanya dilakukan jika wajah terdeteksi minimal pada beberapa frame.",
-                "decision_explanation": (
-                    f"Video tidak diklasifikasikan karena hanya {face_detected_count} "
-                    f"frame wajah terdeteksi dari minimal {min_face_frames} frame yang dibutuhkan."
-                ),
-                "duration_seconds": duration_seconds,
-                "message": "Wajah tidak terdeteksi atau tidak cukup jelas. Upload video wajah untuk dianalisis.",
-                "frames_used": len(frame_infos),
-                "face_detected_count": face_detected_count,
-                "min_face_frames": min_face_frames,
-                "feature_debug": feature_debug,
-                "frames": frames_response
-            })
-
-        result = predict_with_classifier(features)
-
-        duration_seconds = round(time.time() - start_time, 2)
-
-        # Detail frame:
-        # Model V3 menghasilkan score pada level video, bukan score frame asli.
-        # Agar website tidak menyesatkan, frame tetap dikirim dengan note.
-        frames_response = []
-        for frame in frame_infos:
-            frames_response.append({
-                "frame_time": frame["frame_time"],
-                "status": "frame digunakan",
-                "face_detected": frame["face_detected"],
-                "face_confidence": frame["face_confidence"],
-                "crop_method": frame["crop_method"],
-                "repeated_frame": frame["repeated_frame"],
-                "bbox": frame["bbox"],
-                "note": "Score prediksi dihitung pada level video, bukan per-frame."
-            })
-
-        return jsonify({
-            "success": True,
-            "prediction": result["prediction"],
-            "label": result.get("label", result["prediction"]),
-            "status": result.get("status", result.get("label", result["prediction"])),
-            "confidence": result["confidence"],
-            "real_score": result["real_score"],
-            "fake_score": result["fake_score"],
-            "base_score_fake": result.get("base_score_fake"),
-            "local_score_fake": result.get("local_score_fake"),
-            "threshold": result["threshold"],
-            "margin": result["margin"],
-            "confidence_note": result["confidence_note"],
-            "decision_rule": result["decision_rule"],
-            "decision_explanation": result["decision_explanation"],
-            "model_version": result.get("model_version", MODEL_VERSION),
-            "duration_seconds": duration_seconds,
-            "message": "Prediksi berhasil",
-            "frames_used": len(frame_infos),
-            "feature_debug": feature_debug,
-            "frames": frames_response
-        })
-
-    except Exception as error:
-        traceback.print_exc()
-
-        return jsonify({
-            "success": False,
-            "message": f"Video tidak dapat diproses: {str(error)}"
-        }), 500
-
-
-# Load otomatis saat module diimport oleh server production.
-load_all_models()
-
-
-if __name__ == "__main__":
-    host = os.getenv("FLASK_HOST", "127.0.0.1")
-    port = int(os.getenv("FLASK_PORT", "5000"))
-    debug = os.getenv("FLASK_DEBUG", "True").lower() == "true"
-
-    app.run(host=host, port=port, debug=debug)

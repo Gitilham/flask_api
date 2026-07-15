@@ -1,0 +1,22 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic-settings
+python-dotenv
+numpy
+pandas
+opencv-python-headless
+Pillow
+joblib
+ultralytics
+tensorflow
+xgboost
+scikit-learn
+
+# Development/test dependencies
+pytest
+pytest-asyncio
+httpx
+
+# torch/torchvision sengaja dipasang terpisah dari CPU wheel index di Dockerfile.
+
